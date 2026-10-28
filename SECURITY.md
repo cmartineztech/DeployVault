@@ -17,9 +17,10 @@ In the supported workflow, plaintext credentials are not intentionally persisted
 ## In-Scope Security Properties
 
 - Credentials are not intentionally persisted as plaintext by DeployVault.
-- Vault contents are encrypted and authenticated against modification.
-- Incorrect seed material and modified payloads are rejected.
-- File access can be restricted through SMB permissions and NTFS ACLs.
+- Vault contents are encrypted (`AES-256-CBC`) and authenticated (`HMAC-SHA256`) using keys derived via `PBKDF2-HMAC-SHA256` (`Algorithm = 2`, 100,000 iterations), with backward-compatible reading of `Algorithm = 1` (`PBKDF2-HMAC-SHA1`).
+- Incorrect seed material and modified payloads are rejected via constant-time HMAC tag comparison.
+- File and directory access is restricted immediately upon initialization, backup, rotation, and restore using locale-independent well-known SIDs (`S-1-5-18`, `S-1-5-32-544`, and `CurrentUser`), and can be further scoped for deployment readers via `SetDeployVaultACL.ps1`.
+- Secret reads and mutations are blocked when PowerShell Transcription or Script Block Logging policies (including `WOW6432Node`) or `$global:Transcript` are active, and deserialized entry `.Password` fields are scrubbed in `finally` blocks.
 
 ## Out-of-Scope Threats
 

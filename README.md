@@ -57,22 +57,24 @@ DeployVault uses standard cryptographic primitives with operational safeguards a
 - **Protection Scope:** Detects payload tampering and prevents unauthenticated ciphertext modification. Confidentiality depends on keeping the vault-and-seed pair inside the trusted deployment boundary.
 
 ### 2. Key Derivation & Memory Hygiene
-- **Key Derivation Function:** PBKDF2 (`Rfc2898DeriveBytes`) utilizing 100,000 iterations over a 32-byte cryptographically random salt.
+- **Key Derivation Function:** PBKDF2-HMAC-SHA256 (`Algorithm = 2`, 100,000 iterations over a 32-byte cryptographically random salt, with a deterministic pure-.NET `HMACSHA256` fallback when the 4-argument `Rfc2898DeriveBytes` constructor is unavailable on older .NET builds). Legacy `Algorithm = 1` (`PBKDF2-HMAC-SHA1`) vaults remain readable for backward compatibility and are transparently upgraded to `Algorithm = 2` on the next write.
+- **Single-Derivation Lock Reuse:** Within a locked mutation (`Set-VaultCredential`, `Remove-VaultCredential`, `Write-VaultEntries`), the derived 64-byte master key is passed across internal read, encrypt, and pre-commit verification steps so PBKDF2 runs once per operation.
 - **Key Separation:** Generates 64 derived bytes total: 32 bytes for the AES-256 encryption key and 32 bytes for the HMAC-SHA256 authentication tag.
-- **Memory Hygiene:** Sensitive byte arrays are explicitly cleared when practical via `[Array]::Clear()`. Managed strings and PowerShell objects cannot be reliably zeroed and may remain in process memory until reclaimed by .NET.
+- **Memory Hygiene:** Sensitive byte arrays are explicitly cleared via `[Array]::Clear()`, and deserialized entry `.Password` properties are scrubbed via `Clear-VaultEntriesMemory` in `finally` blocks across all CRUD and lifecycle cmdlets.
 
 ### 3. Authentication-Tag Comparison
 - **Fixed-Work Comparison:** `Test-VaultFixedTimeEqual` compares every byte when the tag lengths match, avoiding an early exit based on the first differing byte. The implementation has not undergone dedicated side-channel analysis.
 
 ### 4. Crash Resilience & Pre-Commit Verification
-- **Pre-Commit Verification:** All write operations build and encrypt a candidate payload into a temporary file (`.tmp`), re-read, and decrypt the temporary file in memory before touching the live vault.
-- **Single-File Replacement:** Normal vault-content updates use `[System.IO.File]::Replace` to replace the live vault file and retain a backup. Seed rotation and restore update a vault-and-seed pair sequentially and must be treated as maintenance operations with recovery artifacts.
+- **Pre-Commit Verification:** All write operations build and encrypt a candidate payload into a temporary file (`.tmp`), apply restrictive NTFS ACLs using locale-independent SIDs (`CurrentUser`, `S-1-5-18`, `S-1-5-32-544`), and re-read/decrypt the temporary file in memory before touching the live vault.
+- **Single-File Replacement & Mid-Swap Read Retry:** Normal vault-content updates use `[System.IO.File]::Replace` to replace the live vault file and retain a backup. `Read-VaultEnvelope` includes a 1-retry (150ms) backoff to tolerate transient mid-swap reads between `localseed.bin` and `localvault.bin`.
 
 ### 5. Multi-Process Concurrency Locking
 - **Exclusive Mutation Lock:** Credential mutations and lifecycle operations acquire an exclusive filesystem lock (`localvault.bin.lock`) with timeout retry behavior. Credential reads are lock-free; prevent WinPE reads during seed rotation or restore.
 
-### 6. Logging Safety
-- **Policy Check:** `Assert-VaultSafeLogging` blocks secret operations when Windows PowerShell transcription is enabled through the checked `HKLM` or `HKCU` policy locations.
+### 6. Logging Safety & Locale-Independent ACLs
+- **Policy Check:** `Assert-VaultSafeLogging` blocks secret reads and mutations when Windows PowerShell transcription or script block logging is enabled through `HKLM` or `HKCU` policy paths (including `WOW6432Node`) or when `$global:Transcript` is set.
+- **Locale-Independent SIDs:** `Initialize-Vault`, `Protect-VaultDirectoryAcl`, `Protect-VaultFileAcl`, and `SetDeployVaultACL.ps1` use well-known SIDs (`S-1-5-18` Local SYSTEM and `S-1-5-32-544` Builtin Administrators) rather than localized account names so ACL lockdown works on non-English Windows installations.
 - **Operator Requirement:** An interactively started transcript is not reliably detectable through supported Windows PowerShell 5.1 APIs. Stop all transcripts and disable diagnostic command/output capture before retrieving or updating credentials.
 
 ---
@@ -262,12 +264,13 @@ For a key with no natural username, use a non-secret descriptor such as `api-key
 ## Lifecycle Operations
 
 ### Master Seed Rotation
-Re-key the vault with a new master seed while retaining saved credentials. Rotation executes under an exclusive mutation lock and creates recovery files:
+Re-key the vault with a new master seed while retaining saved credentials. Rotation executes under an exclusive mutation lock, applies restrictive ACLs to `.rotation.bak` recovery files, and supports `-RemoveRecoveryFiles` to purge recovery artifacts automatically after verification:
 
 ```powershell
 Invoke-VaultSeedRotation `
     -VaultPath .\Vault\localvault.bin `
-    -SeedPath .\Vault\localseed.bin
+    -SeedPath .\Vault\localseed.bin `
+    -RemoveRecoveryFiles
 ```
 
 Schedule rotation during a maintenance window with no active WinPE readers. The seed and vault files are replaced sequentially, so an unlocked reader could otherwise observe a mismatched pair. Protect and remove recovery files according to your recovery and retention policy after validating the rotated vault.
@@ -286,14 +289,15 @@ Backup-Vault `
 After backup creation, verify the effective NTFS ACLs and confirm that only the intended administrative identities can read the backup directory. Treat any ACL error as a failed backup-security operation.
 
 ### Restoring a Backup
-Restore a decryptable backup pair after validating its envelope schema. `Restore-Vault` verifies the installed result against the selected candidate pair, but it does not require the candidate `VaultId` to match the current live vault. Administrators must select and verify the intended backup pair before approving restoration:
+Restore a decryptable backup pair after validating its envelope schema. `Restore-Vault` verifies the installed result against the selected candidate pair, applies restrictive ACLs to `.pre-restore` recovery files, and supports `-RemoveRecoveryFiles` to purge them after post-swap validation:
 
 ```powershell
 Restore-Vault `
     -VaultPath .\Vault\localvault.bin `
     -SeedPath .\Vault\localseed.bin `
     -VaultBackup .\Vault\Backups\vault-20260802T100000000Z.bin `
-    -SeedBackup .\Vault\Backups\seed-20260802T100000000Z.bin
+    -SeedBackup .\Vault\Backups\seed-20260802T100000000Z.bin `
+    -RemoveRecoveryFiles
 ```
 
 Perform restores during a maintenance window with no active WinPE readers. Keep the generated pre-restore recovery files until the restored vault has been validated, then protect or remove them according to policy.
